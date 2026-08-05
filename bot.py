@@ -3,7 +3,14 @@ m² Agency — Telegram Lead Bot
 Квалификация лидов по недвижимости на первичном рынке.
 """
 
+import json
 import logging
+import re
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -19,8 +26,61 @@ from telegram.ext import (
 BOT_TOKEN = "8709163271:AAEHVCAN3mYOJnY6yVCl4ee69Gd0yNhygWI"
 CEO_CHAT_ID = 853426594
 
+WORKSPACE_DIR = Path(__file__).resolve().parent
+LEADS_FILE = WORKSPACE_DIR / "leads.jsonl"
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
+RATE_LIMIT_MSG_PER_MIN = 20
+MAX_TEXT_LEN = 500
+
 # ── Состояния диалога ─────────────────────────────────────────────────────────
 COUNTRY, BUDGET, GOAL, TIMELINE, CONTACT = range(5)
+
+# ── Rate limiting (в памяти процесса) ─────────────────────────────────────────
+_rate_limit_buckets: dict[int, deque] = defaultdict(deque)
+
+
+def is_rate_limited(user_id: int) -> bool:
+    now = time.monotonic()
+    bucket = _rate_limit_buckets[user_id]
+    bucket.append(now)
+    while bucket and now - bucket[0] > 60:
+        bucket.popleft()
+    return len(bucket) > RATE_LIMIT_MSG_PER_MIN
+
+
+async def check_rate_limit(update: Update) -> bool:
+    """True если запрос нужно молча отбросить (rate limit)."""
+    user = update.effective_user
+    if user is None:
+        return False
+    if is_rate_limited(user.id):
+        if update.effective_message is not None:
+            await update.effective_message.reply_text(
+                "Слишком много сообщений подряд. Подождите минуту и попробуйте снова."
+            )
+        logger.warning("Rate limit hit | tg_user_id=%s", user.id)
+        return True
+    return False
+
+
+# ── Валидация контакта ────────────────────────────────────────────────────────
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_RE = re.compile(r"^[\d\s\-\+\(\)]{7,20}$")
+USERNAME_RE = re.compile(r"^@[A-Za-z0-9_]{4,}$")
+
+
+def looks_like_contact(text: str) -> bool:
+    text = text.strip()
+    return bool(EMAIL_RE.match(text) or PHONE_RE.match(text) or USERNAME_RE.match(text))
+
+
+def save_lead(data: dict) -> None:
+    """Дописывает заявку в leads.jsonl (одна строка = один JSON-объект)."""
+    LEADS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LEADS_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+    logger.info("Lead saved | tg_user_id=%s", data.get("tg_user_id"))
 
 # ── Логирование ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -105,21 +165,65 @@ def get_user_link(user) -> str:
 # ── Шаг 1: /start или любое первое сообщение ──────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сброс диалога и начало с шага 1."""
+    """Сброс диалога и начало с шага 0 — выбор типа обращения."""
+    if await check_rate_limit(update):
+        return ConversationHandler.END
     context.user_data.clear()
 
     text = (
         "Добро пожаловать в m² Agency. Мы работаем только с первичным рынком — "
         "застройщики Дубая, Грузии, Таиланда и ещё 9 стран. Комиссия с вас — 0%.\n\n"
-        "Чтобы подобрать варианты, уточним несколько вещей. Какая страна вас интересует?"
+        "С чем вы к нам?"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Подбор недвижимости", callback_data="entry_new")],
+            [InlineKeyboardButton("Я уже клиент", callback_data="entry_existing")],
+            [InlineKeyboardButton("По вакансии", callback_data="entry_vacancy")],
+        ]
     )
 
     if update.message:
-        await update.message.reply_text(text, reply_markup=kb_country())
+        await update.message.reply_text(text, reply_markup=kb)
     elif update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=kb_country())
+        await update.callback_query.message.reply_text(text, reply_markup=kb)
 
+    return ConversationHandler.END
+
+
+async def entry_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text("Какая страна вас интересует?", reply_markup=kb_country())
     return COUNTRY
+
+
+async def entry_existing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        "Рады снова вас видеть!\n\n"
+        "Если у вас уже есть договорённость с нашим специалистом — просто напишите ему напрямую: @SolomonDavidovich\n\n"
+        "Если нужна связь по текущей сделке или новый вопрос — напишите здесь, мы передадим специалисту."
+    )
+    return ConversationHandler.END
+
+
+async def entry_vacancy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        "Спасибо за интерес к m² Agency!\n\n"
+        "Формат заявок на вакансии у нас другой - напишите нам напрямую на почту:\n\n"
+        "hello@m2agencyre.com\n\n"
+        "В письме укажите: на какую вакансию откликаетесь, резюме/портфолио и контакт для связи.\n\n"
+        "Мы ответим в течение 1-2 рабочих дней."
+    )
+    return ConversationHandler.END
 
 
 # ── Шаг 2: страна выбрана ─────────────────────────────────────────────────────
@@ -180,10 +284,21 @@ async def timeline_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ── Шаг 6: контакт получен, уведомляем CEO ────────────────────────────────────
 
 async def contact_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await check_rate_limit(update):
+        return CONTACT
     user = update.effective_user
     contact_text = update.message.text.strip()
-    context.user_data["contact"] = contact_text
 
+    if len(contact_text) > MAX_TEXT_LEN:
+        await update.message.reply_text("Слишком длинный ответ, сократите, пожалуйста.")
+        return CONTACT
+    if not looks_like_contact(contact_text):
+        await update.message.reply_text(
+            "Не могу распознать контакт. Укажите, пожалуйста, телефон (+...), email или @username в Telegram."
+        )
+        return CONTACT
+
+    context.user_data["contact"] = contact_text
     data = context.user_data
 
     # Ответ пользователю
@@ -219,6 +334,18 @@ async def contact_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         logger.info("Уведомление CEO отправлено. User ID: %s", user.id)
     except Exception as e:
         logger.error("Не удалось отправить уведомление CEO: %s", e)
+
+    save_lead({
+        "timestamp": datetime.now(MOSCOW_TZ).isoformat(),
+        "tg_user_id": user.id,
+        "tg_username": f"@{user.username}" if user.username else None,
+        "tg_first_name": user.first_name,
+        "contact": contact_text,
+        "country": data.get("country"),
+        "budget": data.get("budget"),
+        "goal": data.get("goal"),
+        "timeline": data.get("timeline"),
+    })
 
     context.user_data.clear()
     return ConversationHandler.END
@@ -256,6 +383,7 @@ def main() -> None:
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
+            CallbackQueryHandler(entry_new, pattern="^entry_new$"),
         ],
         states={
             COUNTRY: [
@@ -286,6 +414,8 @@ def main() -> None:
     )
 
     app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(entry_existing, pattern="^entry_existing$"))
+    app.add_handler(CallbackQueryHandler(entry_vacancy, pattern="^entry_vacancy$"))
     # Любое сообщение вне активного диалога — предлагаем /start
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_message))
 
