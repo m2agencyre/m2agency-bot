@@ -4,6 +4,7 @@ m² Agency — Telegram Lead Bot
 """
 
 import json
+import os
 import logging
 import re
 import time
@@ -23,7 +24,7 @@ from telegram.ext import (
 )
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
-BOT_TOKEN = "8709163271:AAEHVCAN3mYOJnY6yVCl4ee69Gd0yNhygWI"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 CEO_CHAT_ID = 853426594
 
 WORKSPACE_DIR = Path(__file__).resolve().parent
